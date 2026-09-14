@@ -1,0 +1,1 @@
+ 64 |             smogon_spec=args.month or MOST_RECENT,\n 65 |         )\n 66 |     except ExtStatsError as exc:\n 67 |         print(f\"error: {exc}\", file=sys.stderr)\n 68 |         return 2\n 69 |     print(summary(records, cache_root=args.cache_root))\n 70 |     return 0
