@@ -12,6 +12,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+      QT_QPA_PLATFORM: offscreen
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +47,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libegl1 \
             libgl1 \
+            libgl1-mesa-dri \
             libxkbcommon-x11-0 \
+            libfontconfig1 \
+            libdbus-1-3 \
             libxcb-cursor0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -56,8 +60,9 @@ jobs:
             libxcb-shape0 \
             libxcb-xfixes0 \
             libxcb-xinerama0 \
-            libfontconfig1 \
-            libdbus-1-3
+            libxcb-sync1 \
+            libxcb-shm0 \
+            libx11-xcb1
 
       - name: Install Python Dependencies
         run: |
@@ -96,5 +101,6 @@ jobs:
           ARCHIVE_FILE=$(ls ${{ matrix.artifact_pattern }} | head -n 1)
           echo "Pushing $ARCHIVE_FILE to itch.io (channel: ${{ matrix.channel }}, version: $VERSION_TAG)..."
           butler push "$ARCHIVE_FILE" "cfewkes/fourslice:${{ matrix.channel }}" --userversion "$VERSION_TAG"
+
 
 
