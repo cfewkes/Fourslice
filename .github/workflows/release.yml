@@ -10,6 +10,8 @@ jobs:
   build:
     name: Build (${{ matrix.os }} - ${{ matrix.channel }})
     runs-on: ${{ matrix.os }}
+    env:
+      BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
     strategy:
       fail-fast: false
       matrix:
@@ -78,11 +80,11 @@ jobs:
           path: ${{ matrix.artifact_pattern }}
 
       - name: Setup Butler
-        if: ${{ secrets.BUTLER_API_KEY != '' }}
+        if: env.BUTLER_API_KEY != ''
         uses: remarkablegames/setup-butler@v3
 
       - name: Push to itch.io via Butler
-        if: ${{ secrets.BUTLER_API_KEY != '' }}
+        if: env.BUTLER_API_KEY != ''
         shell: bash
         env:
           BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
@@ -94,4 +96,5 @@ jobs:
           ARCHIVE_FILE=$(ls ${{ matrix.artifact_pattern }} | head -n 1)
           echo "Pushing $ARCHIVE_FILE to itch.io (channel: ${{ matrix.channel }}, version: $VERSION_TAG)..."
           butler push "$ARCHIVE_FILE" "cfewkes/fourslice:${{ matrix.channel }}" --userversion "$VERSION_TAG"
+
 
