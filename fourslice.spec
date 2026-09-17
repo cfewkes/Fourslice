@@ -98,6 +98,18 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Platform-specific icon selection
+if sys.platform == "darwin":
+    icns_file = repo_root / "fourslice" / "gui" / "assets" / "FourSliceLogo.icns"
+    if icns_file.exists():
+        app_icon = str(icns_file)
+    else:
+        app_icon = str(repo_root / "fourslice" / "gui" / "assets" / "FourSliceLogo.png")
+elif sys.platform == "win32":
+    app_icon = str(repo_root / "fourslice" / "gui" / "assets" / "FourSliceLogo.ico")
+else:
+    app_icon = str(repo_root / "fourslice" / "gui" / "assets" / "FourSliceLogo.png")
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -114,7 +126,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(repo_root / "fourslice" / "gui" / "assets" / "FourSliceLogo.ico"),
+    icon=app_icon,
 )
 
 coll = COLLECT(
@@ -127,4 +139,23 @@ coll = COLLECT(
     upx_exclude=[],
     name="Fourslice",
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="Fourslice.app",
+        icon=app_icon if app_icon.endswith(".icns") else None,
+        bundle_identifier="io.itch.cfewkes.fourslice",
+        info_plist={
+            "CFBundleName": "Fourslice",
+            "CFBundleDisplayName": "Fourslice",
+            "CFBundleExecutable": "Fourslice",
+            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion": "1.0.0",
+            "NSHighResolutionCapable": "True",
+            "LSMinimumSystemVersion": "10.15",
+            "NSHumanReadableCopyright": "Copyright © 2026",
+        },
+    )
+
 

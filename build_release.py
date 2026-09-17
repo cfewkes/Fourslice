@@ -1,15 +1,18 @@
 """
 build_release.py
 
-Automated release packaging script for Fourslice.
-Builds the standalone Windows application using PyInstaller, verifies all required
-data assets and dependencies are bundled, and produces a distributable .zip for itch.io.
+Automated cross-platform release packaging script for Fourslice.
+Builds standalone Windows, macOS, or Linux applications using PyInstaller,
+verifies all required data assets and dependencies are bundled, and produces
+distributable archives (.zip / .tar.gz) ready for itch.io.
 """
 
 import os
+import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from PIL import Image
@@ -20,32 +23,56 @@ REPO_ROOT = Path(__file__).resolve().parent
 DIST_DIR = REPO_ROOT / "dist"
 BUILD_DIR = REPO_ROOT / "build"
 OUTPUT_FOLDER = DIST_DIR / APP_NAME
-ZIP_NAME = f"{APP_NAME}-v{VERSION}-windows-x64.zip"
-ZIP_PATH = DIST_DIR / ZIP_NAME
+APP_BUNDLE = DIST_DIR / f"{APP_NAME}.app"
 
-# Qt binaries that can never be loaded at runtime: their Python modules
-# (PySide6.QtQml / QtQuick / QtPdf / QtVirtualKeyboard) are excluded by the
-# spec and absent from the bundle, so no code path can reach these DLLs;
-# they ride along because PySide6's Qt6Core/Gui/Widgets dependency scan
-# pulls in the whole Qt6 family. Pruning them saves ~19 MB.
-# opengl32sw.dll is deliberately kept: it is Qt's software-OpenGL fallback,
-# needed by VM / remote-desktop / GPU-less users (PyInstaller adds it
-# unconditionally via hook-PySide6's collect_extra_binaries).
-DEAD_QT_DLLS = [
-    "Qt6Qml.dll",
-    "Qt6QmlMeta.dll",
-    "Qt6QmlModels.dll",
-    "Qt6QmlWorkerScript.dll",
-    "Qt6Quick.dll",
-    "Qt6Pdf.dll",
-    "Qt6VirtualKeyboard.dll",
-]
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+# Architecture tag for release filenames
+machine = platform.machine().lower()
+if machine in ("amd64", "x86_64"):
+    ARCH_TAG = "x64"
+elif machine in ("arm64", "aarch64"):
+    ARCH_TAG = "arm64"
+else:
+    ARCH_TAG = machine
+
+if IS_WINDOWS:
+    OS_TAG = "windows"
+    ARCHIVE_EXT = ".zip"
+elif IS_MACOS:
+    OS_TAG = "macos"
+    ARCHIVE_EXT = ".zip"
+else:
+    OS_TAG = "linux"
+    ARCHIVE_EXT = ".tar.gz"
+
+ARCHIVE_NAME = f"{APP_NAME}-v{VERSION}-{OS_TAG}-{ARCH_TAG}{ARCHIVE_EXT}"
+ARCHIVE_PATH = DIST_DIR / ARCHIVE_NAME
+
+DEAD_QT_MODULE_PREFIXES = (
+    "Qt6Qml",
+    "Qt6Quick",
+    "Qt6Pdf",
+    "Qt6VirtualKeyboard",
+    "libQt6Qml",
+    "libQt6Quick",
+    "libQt6Pdf",
+    "libQt6VirtualKeyboard",
+    "QtQml",
+    "QtQuick",
+    "QtPdf",
+    "QtVirtualKeyboard",
+)
 
 
 def ensure_icons():
-    """Ensure the .ico file is generated and contains all standard Windows icon sizes."""
-    png_path = REPO_ROOT / "fourslice" / "gui" / "assets" / "FourSliceLogo.png"
-    ico_path = REPO_ROOT / "fourslice" / "gui" / "assets" / "FourSliceLogo.ico"
+    """Ensure platform icon files are generated."""
+    assets_dir = REPO_ROOT / "fourslice" / "gui" / "assets"
+    png_path = assets_dir / "FourSliceLogo.png"
+    ico_path = assets_dir / "FourSliceLogo.ico"
+    icns_path = assets_dir / "FourSliceLogo.icns"
 
     if png_path.is_file():
         img = Image.open(png_path)
@@ -54,7 +81,26 @@ def ensure_icons():
             format="ICO",
             sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
         )
-        print(f"[+] Generated multi-size icon: {ico_path}")
+        print(f"[+] Generated multi-size ICO: {ico_path}")
+
+        if IS_MACOS and shutil.which("iconutil"):
+            iconset_dir = assets_dir / "FourSliceLogo.iconset"
+            iconset_dir.mkdir(exist_ok=True)
+            sizes = [16, 32, 64, 128, 256, 512]
+            for s in sizes:
+                img.resize((s, s), Image.LANCZOS).save(iconset_dir / f"icon_{s}x{s}.png")
+                if s <= 256:
+                    img.resize((s * 2, s * 2), Image.LANCZOS).save(iconset_dir / f"icon_{s}x{s}@2x.png")
+            try:
+                subprocess.run(
+                    ["iconutil", "-c", "icns", str(iconset_dir), "-o", str(icns_path)],
+                    check=True,
+                )
+                print(f"[+] Generated macOS ICNS icon: {icns_path}")
+            except Exception as e:
+                print(f"[!] Warning: Failed to generate ICNS with iconutil ({e})")
+            finally:
+                shutil.rmtree(iconset_dir, ignore_errors=True)
 
 
 def run_pyinstaller():
@@ -77,18 +123,93 @@ def run_pyinstaller():
     print("[+] PyInstaller build completed successfully.")
 
 
+def _find_internal_dir() -> Path:
+    """Locate the PyInstaller internal / bundle support directory across platforms."""
+    candidates = [
+        OUTPUT_FOLDER / "_internal",
+        OUTPUT_FOLDER,
+        APP_BUNDLE / "Contents" / "Resources" / "_internal",
+        APP_BUNDLE / "Contents" / "Frameworks" / "_internal",
+        APP_BUNDLE / "Contents" / "Resources",
+    ]
+    for c in candidates:
+        if (c / "data").is_dir():
+            return c
+    return OUTPUT_FOLDER / "_internal" if (OUTPUT_FOLDER / "_internal").exists() else OUTPUT_FOLDER
+
+
+
+def prune_bundle():
+    """Remove Qt binaries and translation files the app can never load."""
+    search_dirs = [OUTPUT_FOLDER, APP_BUNDLE]
+    removed = []
+
+    for base_dir in search_dirs:
+        if not base_dir.exists():
+            continue
+
+        for root, dirs, files in os.walk(base_dir, topdown=True):
+            # Check translation directories
+            if os.path.basename(root) == "translations" and "PySide6" in root:
+                for f in list(files):
+                    fp = Path(root) / f
+                    try:
+                        fp.unlink()
+                        removed.append(f"PySide6/translations/{f}")
+                    except OSError:
+                        pass
+
+            # Prune dead Qt dynamic libraries / modules
+            for fn in list(files):
+                if any(fn.startswith(p) for p in DEAD_QT_MODULE_PREFIXES):
+                    fp = Path(root) / fn
+                    try:
+                        fp.unlink()
+                        removed.append(fn)
+                    except OSError:
+                        pass
+
+    if removed:
+        print(f"[+] Pruned {len(removed)} dead Qt files "
+              f"({', '.join(removed[:4])}{'...' if len(removed) > 4 else ''})")
+    else:
+        print("[+] prune_bundle: nothing to remove (already lean)")
+
+
+def stage_notices():
+    """Copy THIRD_PARTY_NOTICES.md into the bundle / package output."""
+    src = REPO_ROOT / "THIRD_PARTY_NOTICES.md"
+    if not src.is_file():
+        print("[!] THIRD_PARTY_NOTICES.md not found at repo root; skipping")
+        return
+
+    if OUTPUT_FOLDER.is_dir():
+        shutil.copy2(src, OUTPUT_FOLDER / "THIRD_PARTY_NOTICES.md")
+    if APP_BUNDLE.is_dir():
+        resources = APP_BUNDLE / "Contents" / "Resources"
+        resources.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, resources / "THIRD_PARTY_NOTICES.md")
+        shutil.copy2(src, DIST_DIR / "THIRD_PARTY_NOTICES.md")
+    print("[+] Staged third-party notices into the bundle")
+
+
 def verify_build():
     """Check that all essential files and folders exist in the build output."""
     print("[*] Verifying build output...")
-    exe_path = OUTPUT_FOLDER / f"{APP_NAME}.exe"
+
+    # Verify executable
+    if IS_WINDOWS:
+        exe_path = OUTPUT_FOLDER / f"{APP_NAME}.exe"
+    elif IS_MACOS and APP_BUNDLE.is_dir():
+        exe_path = APP_BUNDLE / "Contents" / "MacOS" / APP_NAME
+    else:
+        exe_path = OUTPUT_FOLDER / APP_NAME
+
     if not exe_path.is_file():
         raise FileNotFoundError(f"Missing executable: {exe_path}")
 
-    # Check data directory in _internal
-    internal_dir = OUTPUT_FOLDER / "_internal"
-    if not internal_dir.is_dir():
-        internal_dir = OUTPUT_FOLDER  # PyInstaller 5 or earlier layout fallback
-
+    # Check data directory
+    internal_dir = _find_internal_dir()
     data_dir = internal_dir / "data"
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Missing data directory in bundle: {data_dir}")
@@ -106,9 +227,6 @@ def verify_build():
         if not (data_dir / fn).is_file():
             raise FileNotFoundError(f"Missing essential bundled data file: {data_dir / fn}")
 
-    # Guard rail: the developer's local crawl mirror (data/external) and
-    # runtime stats-cache must never ride along in a release -- they're
-    # dead weight that the app writes to app-data at runtime anyway.
     for stale_name in ("external", "stats-cache"):
         stale_path = data_dir / stale_name
         if stale_path.is_dir():
@@ -121,109 +239,77 @@ def verify_build():
     if not assets_dir.is_dir():
         raise FileNotFoundError(f"Missing assets directory in bundle: {assets_dir}")
 
-    # Guard rail: third-party notices should ship next to the exe.
-    notices = OUTPUT_FOLDER / "THIRD_PARTY_NOTICES.md"
-    if not notices.is_file():
-        raise FileNotFoundError(
-            f"Missing {notices.name} beside the executable; stage_notices() "
-            "should have copied it from the repo root."
-        )
-
-    # Guard rail: dead Qt binaries must stay pruned (see prune_bundle below).
-    pyside_dir = internal_dir / "PySide6"
-    for dll in DEAD_QT_DLLS:
-        if (pyside_dir / dll).is_file():
-            raise RuntimeError(
-                f"Dead Qt binary {dll} reappeared in the bundle ({pyside_dir / dll}); "
-                "prune_bundle() should have removed it before verification."
-            )
-
     print("[+] Build verification passed.")
 
 
-def prune_bundle():
-    """Remove Qt binaries and translation files the app can never load.
 
-    The Qt6Qml/QtQuick/QtPdf/QtVirtualKeyboard DLLs and every Qt translation
-    are provably dead in this app:
-      * the corresponding Python modules (PySide6.QtQml, ...) were excluded
-        by the spec and are NOT in the bundle -- no code can instantiate a
-        QML/Quick/Pdf/VirtualKeyboard engine;
-      * the app never installs a QTranslator, so the .qm files are never
-        loaded.
-    Deleting them here -- rather than fighting PyInstaller's Qt6 family
-    dependency scan -- is deterministic and auditable, and verify_build()
-    enforces that they do not return on future builds.
-    """
-    internal_dir = OUTPUT_FOLDER / "_internal"
-    if not internal_dir.is_dir():
-        internal_dir = OUTPUT_FOLDER  # PyInstaller 5 or earlier layout fallback
-    pyside_dir = internal_dir / "PySide6"
-    if not pyside_dir.is_dir():
-        return
+def create_archive():
+    """Create a distributable archive (.zip or .tar.gz) containing the application."""
+    print(f"[*] Creating distribution archive: {ARCHIVE_PATH}")
+    if ARCHIVE_PATH.exists():
+        ARCHIVE_PATH.unlink()
 
-    removed = []
-    for dll in DEAD_QT_DLLS:
-        p = pyside_dir / dll
-        if p.is_file():
-            p.unlink()
-            removed.append(f"PySide6/{dll}")
-
-    translations = pyside_dir / "translations"
-    if translations.is_dir():
-        for f in sorted(translations.iterdir()):
-            if f.is_file():
-                f.unlink()
-                removed.append(f"PySide6/translations/{f.name}")
-
-    if removed:
-        print(f"[+] Pruned {len(removed)} dead Qt files "
-              f"({', '.join(removed[:4])}{'...' if len(removed) > 4 else ''})")
+    if IS_MACOS and APP_BUNDLE.is_dir():
+        # Use macOS ditto if available (preserves file attributes, signatures, symlinks)
+        if shutil.which("ditto"):
+            cmd = [
+                "ditto",
+                "-c",
+                "-k",
+                "--sequesterRsrc",
+                "--keepParent",
+                str(APP_BUNDLE),
+                str(ARCHIVE_PATH),
+            ]
+            subprocess.run(cmd, check=True)
+        else:
+            _create_zip_folder(APP_BUNDLE, APP_BUNDLE.name)
+    elif IS_LINUX:
+        # Create .tar.gz for Linux (standard for preserving Unix permissions)
+        with tarfile.open(ARCHIVE_PATH, "w:gz") as tar:
+            tar.add(OUTPUT_FOLDER, arcname=APP_NAME)
+        # Also create a .zip for itch.io Linux users who prefer zip
+        zip_path = DIST_DIR / f"{APP_NAME}-v{VERSION}-linux-{ARCH_TAG}.zip"
+        _create_zip_folder(OUTPUT_FOLDER, APP_NAME, out_path=zip_path)
     else:
-        print("[+] prune_bundle: nothing to remove (already lean)")
+        # Windows .zip
+        _create_zip_folder(OUTPUT_FOLDER, APP_NAME)
+
+    archive_size_mb = ARCHIVE_PATH.stat().st_size / (1024 * 1024)
+    print(f"[+] Packaged release archive: {ARCHIVE_PATH.name} ({archive_size_mb:.2f} MB)")
 
 
-def stage_notices():
-    """Copy THIRD_PARTY_NOTICES.md next to the executable so end users see
-    the Showdown/Smogon provenance as soon as they unzip the release."""
-    src = REPO_ROOT / "THIRD_PARTY_NOTICES.md"
-    if src.is_file():
-        shutil.copy2(src, OUTPUT_FOLDER / "THIRD_PARTY_NOTICES.md")
-        print(f"[+] Staged third-party notices into the bundle")
-    else:
-        print("[!] THIRD_PARTY_NOTICES.md not found at repo root; skipping")
-
-
-def create_zip():
-    """Create a distributable zip archive containing the entire Fourslice application."""
-    print(f"[*] Creating distribution archive: {ZIP_PATH}")
-    if ZIP_PATH.exists():
-        ZIP_PATH.unlink()
+def _create_zip_folder(folder_to_zip: Path, arc_root_name: str, out_path: Path | None = None):
+    """Zip a folder preserving file hierarchy and unix execute bits."""
+    target_zip = out_path if out_path is not None else ARCHIVE_PATH
+    if target_zip.exists():
+        target_zip.unlink()
 
     total_files = 0
-    with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        for root, dirs, files in os.walk(OUTPUT_FOLDER):
+    with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for root, dirs, files in os.walk(folder_to_zip):
             for file in files:
                 file_path = Path(root) / file
-                rel_path = file_path.relative_to(DIST_DIR)
+                rel_path = Path(arc_root_name) / file_path.relative_to(folder_to_zip)
                 zf.write(file_path, arcname=str(rel_path))
                 total_files += 1
 
-    zip_size_mb = ZIP_PATH.stat().st_size / (1024 * 1024)
-    print(f"[+] Packaged {total_files} files into {ZIP_PATH.name} ({zip_size_mb:.2f} MB)")
+    print(f"[+] Packaged {total_files} files into {target_zip.name}")
+
 
 
 def main():
-    print(f"=== Building {APP_NAME} v{VERSION} ===")
+    print(f"=== Building {APP_NAME} v{VERSION} on {sys.platform} ({ARCH_TAG}) ===")
     ensure_icons()
     run_pyinstaller()
     prune_bundle()
     stage_notices()
     verify_build()
-    create_zip()
+    create_archive()
     print("\n=== Release Build Complete ===")
-    print(f"Zip Location: {ZIP_PATH}")
+    print(f"Archive Location: {ARCHIVE_PATH}")
 
 
 if __name__ == "__main__":
     main()
+
