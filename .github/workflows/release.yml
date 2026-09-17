@@ -77,14 +77,21 @@ jobs:
           name: Fourslice-${{ matrix.channel }}
           path: ${{ matrix.artifact_pattern }}
 
+      - name: Setup Butler
+        if: ${{ secrets.BUTLER_API_KEY != '' }}
+        uses: remarkablegames/setup-butler@v3
+
       - name: Push to itch.io via Butler
-        if: env.BUTLER_API_KEY != ''
-        uses: fasterthanlime/butler-publish@v1.3.0
+        if: ${{ secrets.BUTLER_API_KEY != '' }}
+        shell: bash
         env:
           BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
-        with:
-          pushed_dir: ${{ matrix.artifact_pattern }}
-          user: cfewkes
-          game: fourslice
-          channel: ${{ matrix.channel }}
-          version: ${{ github.ref_name }}
+        run: |
+          VERSION_TAG="${{ github.ref_name }}"
+          if [ -z "$VERSION_TAG" ] || [ "$VERSION_TAG" = "main" ]; then
+            VERSION_TAG="1.0.0"
+          fi
+          ARCHIVE_FILE=$(ls ${{ matrix.artifact_pattern }} | head -n 1)
+          echo "Pushing $ARCHIVE_FILE to itch.io (channel: ${{ matrix.channel }}, version: $VERSION_TAG)..."
+          butler push "$ARCHIVE_FILE" "cfewkes/fourslice:${{ matrix.channel }}" --userversion "$VERSION_TAG"
+
